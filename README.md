@@ -50,7 +50,7 @@ source("caspex_analysis.R")
 inputs <- load_caspex_inputs("example_inputs")
 
 result <- run_caspex(
-  gene             = "ATP7B",                # any HGNC symbol
+  gene             = "gene_name",                # any HGNC symbol
   grnas            = inputs$grnas,
   data_files       = inputs$data_files,
   out_dir          = "caspex_output",
@@ -65,7 +65,7 @@ source("caspex_extras.R")
 extras <- run_caspex_extras(result, out_dir = "caspex_output/extras")
 ```
 
-The thin wrappers `1-try.R` and `1-try-hocomoco.R` reproduce this end-to-end for the shipped ATP7B example; run `source("1-try.R")` for the JASPAR-backed run or `source("1-try-hocomoco.R")` for the HOCOMOCO-backed run.
+The thin wrappers `1-try.R` and `1-try-hocomoco.R` reproduce this end-to-end for the shipped example; run `source("1-try.R")` for the JASPAR-backed run or `source("1-try-hocomoco.R")` for the HOCOMOCO-backed run.
 
 ---
 
@@ -459,10 +459,10 @@ inspect_tf(result, "GATA6")                   # per-TF inspector
 - `caspex_analysis.R` — the pipeline (single source of truth, JASPAR-backed).
 - `caspex_analysis_hocomoco.R` — **alternative motif backend**: same pipeline wired to HOCOMOCO v11/v12 PWMs. Sources `caspex_analysis.R` automatically. See §11.
 - `caspex_extras.R` — supplementary result plots and diagnostics (per-TF one-pagers, TF co-occurrence, ranked events, permutation null, σ sensitivity, jackknife, volcanoes, QC, plus coverage-aware diagnostics D.1–D.3). Source *after* `caspex_analysis.R`; see §12.
-- `1-try.R` — thin runner for the shipped ATP7B 7-gRNA dataset (JASPAR backend, coverage-aware).
+- `1-try.R` — thin runner for the shipped gene specific 7-gRNA dataset (JASPAR backend, coverage-aware).
 - `1-try-hocomoco.R` — same runner using the HOCOMOCO backend.
 - `2-run_caspex_extras_in_all.R` — regenerate the supplementary plots for an existing `result` object without re-running the primary pipeline.
-- `example_inputs/` — per-region manifest (`grnas.tsv`) and the seven `Region*.txt` tables for the shipped ATP7B example.
+- `example_inputs/` — per-region manifest (`grnas.tsv`) and the seven `Region*.txt` tables for the shipped example.
 - `caspex_output/` — everything the pipeline writes (PDFs + CSVs above), including an `extras/` subfolder when the extras runner has been invoked.
 - `caspex_output_hocomoco/` — default output folder of the HOCOMOCO runner.
 - `README.md` — this document (user/developer guide).
@@ -481,7 +481,7 @@ An alternative motif source for the *exact same* pipeline. Same spatial model, s
 
 ### Quick start
 
-A ready-to-run script (`1-try-hocomoco.R`) mirrors `1-try.R` but calls the HOCOMOCO backend. Source it to reproduce the ATP7B analysis end-to-end:
+A ready-to-run script (`1-try-hocomoco.R`) mirrors `1-try.R` but calls the HOCOMOCO backend. Source it to reproduce the analysis end-to-end:
 
 ```r
 source("1-try-hocomoco.R")
@@ -495,7 +495,7 @@ source("caspex_analysis_hocomoco.R")   # also sources caspex_analysis.R
 inputs <- load_caspex_inputs("example_inputs")
 
 result <- run_caspex_hocomoco(
-  gene             = "ATP7B",
+  gene             = "gene_name",
   grnas            = inputs$grnas,
   data_files       = inputs$data_files,
   out_dir          = "caspex_output_hocomoco",
@@ -548,7 +548,7 @@ source("caspex_analysis.R")
 source("caspex_extras.R")
 
 inputs <- load_caspex_inputs("example_inputs")
-result <- run_caspex(gene = "ATP7B",
+result <- run_caspex(gene = "gene_name",
                      grnas = inputs$grnas,
                      data_files = inputs$data_files,
                      coverage_correct = TRUE,
