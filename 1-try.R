@@ -20,7 +20,7 @@ result <- run_caspex(
   out_dir          = "caspex_output",
   coverage_correct = TRUE,                   # coverage-aware per-motif scoring
   cov_floor        = 0.05,                   # relative floor on the denominator
-  edge_guard_frac  = 0.15                    # in-support mask threshold
+  edge_guard_frac  = 0.25                    # in-support mask threshold (5x cov_floor)
 )
 
 source("caspex_extras.R")

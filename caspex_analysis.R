@@ -799,7 +799,7 @@ run_motif_scan <- function(tf_names, promoter_info, threshold_frac = 0.80) {
 #' @param long_data     From load_region_data()
 #' @param pos_map       From match_all_grnas()
 #' @param x_grid        bp grid (TSS-relative)
-#' @param kernel_sigma  Labeling kernel σ in bp (default 250; APEX-ish radius)
+#' @param kernel_sigma  Labeling kernel σ in bp (default 300; APEX-ish radius)
 #' @param weight_mode   "mod_t" (default, moderated t if available else signed
 #'                      z from p), "z", "lfc_pos", "lfc_signed",
 #'                      "lfc_x_negp" (= "weighted", legacy).
@@ -809,7 +809,7 @@ run_motif_scan <- function(tf_names, promoter_info, threshold_frac = 0.80) {
 #' @return list(x, y, region_data, kernel_sigma)
 build_caspex_signal <- function(tf_name, long_data, pos_map,
                                 x_grid       = seq(-2500, 500, by = 5),
-                                kernel_sigma = 250,
+                                kernel_sigma = 300,
                                 weight_mode  = c("mod_t", "z", "lfc_pos",
                                                   "lfc_signed", "lfc_x_negp",
                                                   "weighted")) {
@@ -898,11 +898,11 @@ build_caspex_signal <- function(tf_name, long_data, pos_map,
 #'
 #' @param pos_map       Named bp positions (from match_all_grnas)
 #' @param x_grid        bp grid (TSS-relative)
-#' @param kernel_sigma  Labeling kernel σ (default 250)
+#' @param kernel_sigma  Labeling kernel σ (default 300)
 #' @return list(x, y, pos, kernel_sigma) — `y` is C(x)
 compute_coverage <- function(pos_map,
                              x_grid       = seq(-2500, 500, by = 5),
-                             kernel_sigma = 250) {
+                             kernel_sigma = 300) {
   pos <- as.numeric(pos_map[!is.na(pos_map)])
   y   <- numeric(length(x_grid))
   for (p in pos) y <- y + exp(-0.5 * ((x_grid - p) / kernel_sigma)^2)
@@ -940,7 +940,7 @@ find_local_maxima <- function(x, y, min_height = 0, min_dist = 150) {
 #' @return data.frame(tf, position, weight, motif_based, n_motifs_merged)
 predict_binding_events <- function(tf_name, long_data, pos_map, motif_hits,
                                    x_grid          = seq(-2500, 500, by = 5),
-                                   kernel_sigma    = 250,
+                                   kernel_sigma    = 300,
                                    min_weight_frac = 0.15,
                                    min_peak_dist   = 150,
                                    merge_dist      = 100,
@@ -1058,7 +1058,7 @@ predict_binding_events <- function(tf_name, long_data, pos_map, motif_hits,
 #'
 #' Motivation ---------------------------------------------------------------
 #' CasPEX biotinylation intensity falls off with distance from each gRNA
-#' cut site (APEX-like Gaussian decay, σ ~ 250 bp). So the per-region
+#' cut site (APEX-like Gaussian decay, σ ~ 300 bp). So the per-region
 #' enrichment `w_r` we observe is the product of TRUE OCCUPANCY at nearby
 #' loci × the LABELING EFFICIENCY of the nearest gRNA(s) at that distance.
 #' The smoothed-signal path (`predict_binding_events`) inherits that decay:
@@ -1087,7 +1087,7 @@ predict_binding_events <- function(tf_name, long_data, pos_map, motif_hits,
 #'
 #' Worked example
 #' --------------
-#' R1 at −500, R2 at −1000, σ = 250 bp, w_1 = w_2 = 1.
+#' R1 at −500, R2 at −1000, σ = 300 bp, w_1 = w_2 = 1.
 #' Motifs at −450, −700 (midpoint), −1050:
 #'   m = −450 : s = 0.98·1 + 0.089·1 = 1.07, C = 1.07, β = 1.00
 #'   m = −700 : s = 0.61·1 + 0.61·1 = 1.22, C = 1.22, β = 1.00
@@ -1136,7 +1136,7 @@ predict_binding_events <- function(tf_name, long_data, pos_map, motif_hits,
 predict_binding_events_coverage_aware <- function(
     tf_name, long_data, pos_map, motif_hits,
     x_grid          = seq(-2500, 500, by = 5),
-    kernel_sigma    = 250,
+    kernel_sigma    = 300,
     min_weight_frac = 0.15,
     min_peak_dist   = 150,
     merge_dist      = 100,
@@ -1149,9 +1149,15 @@ predict_binding_events_coverage_aware <- function(
     # to infinity, while this guard prevents β from being evaluated in the
     # low-denominator transition band just inside the clamp (where a real
     # peak-finder / zone-finder can still see the ramp as a spurious peak
-    # or zone). Default 0.15 (= 3× default cov_floor); raise for datasets
-    # with sparse gRNA layouts, lower for densely tiled regions.
-    edge_guard_frac = 0.15,
+    # or zone). Default 0.25 (= 5× default cov_floor); raised from 0.15
+    # because σ=300 extends the single-gRNA tail far enough that 0.15
+    # leaked edge events ~1.4σ west of the westernmost guide. At 0.25 the
+    # trust boundary sits ~1σ outside an isolated guide, matching the
+    # geometric assumption that β is uninformative in the single-gRNA
+    # tail (numerator and denominator are the same Gaussian and cancel).
+    # Raise further (0.30) for sparser gRNA layouts; lower (0.15–0.20)
+    # for densely tiled regions where multi-guide overlap lifts max(C).
+    edge_guard_frac = 0.25,
     # ---- readability guards (prevent HOXB6-style plateau floods) ----
     # `zone_peak_frac`: within each above-threshold zone, only keep motifs
     # whose local β is >= zone_peak_frac × max(β) inside that zone. This
@@ -1164,8 +1170,39 @@ predict_binding_events_coverage_aware <- function(
     # broadly elevated signal (HOXB6 had 273 candidates pre-cap). Set to
     # Inf to disable. Applied AFTER merging so merged centroids are ranked
     # on their combined amplitude.
-    max_events_per_tf = 30
+    max_events_per_tf = 30,
+    # `merge_position`: how to report the position for a merged cluster of
+    # motif candidates. "argmax" (default, new behaviour) snaps the bubble
+    # to the strongest motif in the cluster — so every motif-based bubble
+    # sits exactly on a real motif tick, matching what the no-motif
+    # fallback does at an s(x) peak. "centroid" keeps the legacy
+    # amplitude-weighted mean position, which can land between motifs when
+    # 2-3 of them chain within merge_dist. Motif-less-zone bubbles (single-
+    # candidate clusters emitted at a zone's β peak) are unaffected — they
+    # carry their peak position regardless of this setting.
+    merge_position = c("argmax", "centroid"),
+    # `max_grna_distance`: hard geometric cap in bp on how far a called
+    # event can sit from the nearest gRNA. Events whose
+    # `distance_to_nearest_grna` exceeds this value are dropped AFTER the
+    # merge step. Motivation: in the single-gRNA tail (positions west of
+    # the westernmost guide or east of the easternmost), β = s/C is
+    # mathematically flat because numerator and denominator share the
+    # same Gaussian shape and cancel — so the zone detector can emit a
+    # swarm of bubbles all carrying the same β, even at positions where
+    # the labeling model provides no geometric information to distinguish
+    # them. This cap is the belt-and-suspenders companion to
+    # `edge_guard_frac`: it scales automatically with σ, which the
+    # relative-coverage mask does not. Default NULL resolves to
+    # `kernel_sigma` at runtime (so "events within one σ of a guide").
+    # Set `Inf` to disable. Set to a smaller multiple of σ (e.g. 0.75·σ)
+    # to be stricter about tail leakage.
+    max_grna_distance = NULL
 ) {
+  merge_position <- match.arg(merge_position)
+  # Resolve NULL → kernel_sigma. Doing this in the body (not as a default
+  # expression) keeps the dependence explicit and survives callers that
+  # pass `max_grna_distance = NULL` intentionally.
+  if (is.null(max_grna_distance)) max_grna_distance <- kernel_sigma
   empty <- data.frame(
     tf = character(), position = numeric(), weight = numeric(),
     motif_based = logical(), n_motifs_merged = integer(),
@@ -1209,7 +1246,7 @@ predict_binding_events_coverage_aware <- function(
   # just inside the clamp — where a tiny residual s(x) divided by a tiny
   # c_grid(x) produces an inflated β that peak-finders and zone-finders
   # happily mark as a hit at the west edge. Setting the support floor to
-  # `edge_guard_frac × max(C)` (default 0.15, i.e. 3× the default 0.05
+  # `edge_guard_frac × max(C)` (default 0.25, i.e. 5× the default 0.05
   # cov_floor) pushes the trust boundary well off the clamp transition so
   # the ramp lives in the masked-out zone and can't form a zone on its own.
   # `edge_guard_frac` is capped at no less than cov_floor (the clamp floor)
@@ -1251,6 +1288,17 @@ predict_binding_events_coverage_aware <- function(
                                           numeric(1))
     ev$local_coverage <- approx(x_grid, c_grid, xout = ev$position,
                                  rule = 2)$y
+    # Geometric safety net (see `max_grna_distance` param docs). In the
+    # no-motif fallback, `support_mask` already zeroes s(x) outside the
+    # edge_guard_frac band, so the hard distance cap is mostly redundant
+    # here — but we still apply it for consistency with the motif branch,
+    # and to keep behaviour deterministic if a caller disables
+    # edge_guard_frac while leaving max_grna_distance set.
+    if (is.finite(max_grna_distance)) {
+      ev <- ev[ev$distance_to_nearest_grna <= max_grna_distance, ,
+               drop = FALSE]
+    }
+    if (nrow(ev) == 0) return(empty)
     ev <- ev[order(ev$weight, decreasing = TRUE), , drop = FALSE]
     if (is.finite(max_events_per_tf) && nrow(ev) > max_events_per_tf) {
       ev <- ev[seq_len(max_events_per_tf), , drop = FALSE]
@@ -1357,7 +1405,20 @@ predict_binding_events_coverage_aware <- function(
     if (length(cluster_idx) == 0) next   # defensive: should never trigger
     used[cluster_idx] <- TRUE
     w_sum  <- sum(w_cand[cluster_idx])
-    p_avg  <- sum(pos_cand[cluster_idx] * w_cand[cluster_idx]) / w_sum
+    # Position rule depends on merge_position.
+    # - "argmax" : position of the highest-weighted candidate in the
+    #   cluster. For motif_based clusters, that's the strongest motif's
+    #   exact bp coordinate, so the bubble sits on a motif tick. For a
+    #   zone-fallback single-candidate cluster (no motif survived), the
+    #   top is the zone β-peak and argmax reduces to that peak.
+    # - "centroid" : legacy amplitude-weighted mean position. Can land
+    #   between 2-3 motifs that chained within merge_dist.
+    top_in_cluster <- cluster_idx[which.max(w_cand[cluster_idx])]
+    p_avg  <- if (merge_position == "argmax") {
+      pos_cand[top_in_cluster]
+    } else {
+      sum(pos_cand[cluster_idx] * w_cand[cluster_idx]) / w_sum
+    }
     d_nn   <- min(abs(p_avg - pos_r))
     # Interpolated C(x) at the merged centroid — more faithful than the
     # average of cluster members, which would be biased by the weights.
@@ -1374,6 +1435,19 @@ predict_binding_events_coverage_aware <- function(
     )
   }
   out <- do.call(rbind, events)
+  # Geometric safety net: drop events whose nearest gRNA is farther than
+  # `max_grna_distance`. In the single-gRNA tail beyond the westernmost /
+  # easternmost guide, β = s/C is flat (same Gaussian cancels top and
+  # bottom) and the zone detector can spray bubbles all the way to the
+  # edge_guard_frac mask. This cap clips those at a σ-scaled distance
+  # from the guide layout — complementary to edge_guard_frac, which is
+  # relative to max(C) and doesn't automatically rescale when kernel_sigma
+  # changes.
+  if (is.finite(max_grna_distance)) {
+    out <- out[out$distance_to_nearest_grna <= max_grna_distance, ,
+               drop = FALSE]
+  }
+  if (nrow(out) == 0) return(empty)
   out <- out[order(out$weight, decreasing = TRUE), , drop = FALSE]
   # Top-N cap (readability backstop). Applied AFTER merging so merged
   # centroids compete on their combined amplitude, not on per-motif β.
@@ -1397,16 +1471,21 @@ predict_binding_events_coverage_aware <- function(
 #'   the max-coverage value. Default 0.05 (~20× amplification cap).
 predict_all_binding_events <- function(tfs, long_data, pos_map, motif_results,
                                         x_grid          = seq(-2500, 500, by = 5),
-                                        kernel_sigma    = 250,
+                                        kernel_sigma    = 300,
                                         min_weight_frac = 0.15,
                                         min_peak_dist   = 150,
                                         merge_dist      = 100,
                                         weight_mode     = "mod_t",
                                         coverage_correct = FALSE,
                                         cov_floor        = 0.05,
-                                        edge_guard_frac  = 0.15,
+                                        edge_guard_frac  = 0.25,
                                         zone_peak_frac    = 0.50,
-                                        max_events_per_tf = 30) {
+                                        max_events_per_tf = 30,
+                                        # Coverage-aware only. See
+                                        # predict_binding_events_coverage_aware()
+                                        # for the full description.
+                                        merge_position    = c("argmax", "centroid"),
+                                        max_grna_distance = NULL) {
   mode_tag <- if (coverage_correct)
     "coverage-normalized per-motif (s/C)" else "smoothed-s(x) NNLS"
   message("\nPredicting binding events (", mode_tag, ", \u03c3=",
@@ -1427,6 +1506,8 @@ predict_all_binding_events <- function(tfs, long_data, pos_map, motif_results,
         edge_guard_frac = edge_guard_frac,
         zone_peak_frac    = zone_peak_frac,
         max_events_per_tf = max_events_per_tf,
+        merge_position    = merge_position,
+        max_grna_distance = max_grna_distance,
         x_grid          = x_grid
       )
     } else {
@@ -1472,16 +1553,18 @@ predict_all_binding_events <- function(tfs, long_data, pos_map, motif_results,
 #'            histogram directly below their predicted position, with a thin
 #'            dotted connector up to the signal peak they explain.
 plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
-                                        kernel_sigma    = 250,
+                                        kernel_sigma    = 300,
                                         min_weight_frac = 0.15,
                                         upstream        = 2500,
                                         downstream      = 500,
                                         weight_mode     = "mod_t",
                                         coverage_correct = FALSE,
                                         cov_floor       = 0.05,
-                                        edge_guard_frac = 0.15,
+                                        edge_guard_frac = 0.25,
                                         zone_peak_frac    = 0.50,
-                                        max_events_per_tf = 30) {
+                                        max_events_per_tf = 30,
+                                        merge_position    = c("argmax", "centroid"),
+                                        max_grna_distance = NULL) {
   x_grid <- seq(-upstream, downstream, by = 5)
   sig    <- build_caspex_signal(tf_name, long_data, pos_map, x_grid,
                                  kernel_sigma, weight_mode)
@@ -1495,6 +1578,8 @@ plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
       edge_guard_frac = edge_guard_frac,
       zone_peak_frac    = zone_peak_frac,
       max_events_per_tf = max_events_per_tf,
+      merge_position    = merge_position,
+      max_grna_distance = max_grna_distance,
       x_grid          = x_grid)
   } else {
     predict_binding_events(tf_name, long_data, pos_map, motif_hits,
@@ -1586,7 +1671,12 @@ plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
                  shape = 21, color = "black", stroke = 0.5, alpha = 0.95) +
       geom_text(data = ev,
                 aes(x = position, y = y_base,
-                    label = sprintf("%+.0f bp", position)),
+                    # Bare integer only (no "bp" suffix) — keeps neighbouring
+                    # bubble labels short so they don't overlap when events
+                    # are closely spaced (e.g. "-96" / "-120" instead of
+                    # "-96 bp" / "-120 bp"). x-axis title already declares
+                    # the unit.
+                    label = sprintf("%+.0f", position)),
                 size = 2.4, fontface = "bold", vjust = 2.4,
                 color = COLS$high)
   }
@@ -2397,7 +2487,7 @@ run_caspex <- function(
     motif_thresh  = 0.80,
     tfs_only      = TRUE,
     # Binding deconvolution parameters
-    kernel_sigma     = 250,
+    kernel_sigma     = 300,
     min_weight_frac  = 0.15,
     min_peak_dist    = 150,
     merge_dist       = 100,
@@ -2410,14 +2500,28 @@ run_caspex <- function(
     # that defines the in-support region for β. Set well above `cov_floor`
     # so β is not evaluated in the low-denominator transition band at the
     # tiled-region edges (which would otherwise spawn spurious west-edge
-    # peaks / zones). Default 0.15 = 3× default cov_floor.
-    edge_guard_frac  = 0.15,
+    # peaks / zones). Default 0.25 = 5× default cov_floor (raised from
+    # 0.15 when kernel_sigma went 250 → 300; wider kernel extends the
+    # single-gRNA tail and re-opened the edge artifact at 0.15).
+    edge_guard_frac  = 0.25,
     # Readability guards for coverage-aware mode (ignored if
     # coverage_correct = FALSE). `zone_peak_frac` = per-zone β floor
     # (motifs below frac × zone_peak β are dropped; 0 disables).
     # `max_events_per_tf` = top-N cap applied after merging (Inf disables).
     zone_peak_frac    = 0.50,
     max_events_per_tf = 30,
+    # `merge_position` (coverage-aware only): "argmax" (default) reports
+    # each merged cluster at the position of its strongest motif so
+    # bubbles snap to a real motif tick. "centroid" keeps the legacy
+    # amplitude-weighted mean, which can land between motifs.
+    merge_position    = c("argmax", "centroid"),
+    # `max_grna_distance` (coverage-aware only): hard geometric cap in bp
+    # on how far a called event can sit from the nearest gRNA. NULL
+    # (default) resolves to `kernel_sigma` at runtime — i.e. events must
+    # be within one labeling σ of some guide. Inf disables. Complements
+    # `edge_guard_frac`: the relative-coverage mask does not auto-rescale
+    # with kernel_sigma, this one does.
+    max_grna_distance = NULL,
     # Region-weight mode — applied to BOTH spatial model and signal building.
     # "mod_t" (default) = moderated t (from limma) if the input files carry a
     # `t` column, else a signed z-score derived from the p-value. Alternatives:
@@ -2505,7 +2609,9 @@ run_caspex <- function(
     cov_floor        = cov_floor,
     edge_guard_frac  = edge_guard_frac,
     zone_peak_frac    = zone_peak_frac,
-    max_events_per_tf = max_events_per_tf
+    max_events_per_tf = max_events_per_tf,
+    merge_position    = merge_position,
+    max_grna_distance = max_grna_distance
   )
   message("  Total predicted events: ", nrow(binding_events),
           "  (across ", length(unique(binding_events$tf)), " TFs)")
@@ -2692,7 +2798,9 @@ run_caspex <- function(
                                     cov_floor       = cov_floor,
                                     edge_guard_frac = edge_guard_frac,
                                     zone_peak_frac    = zone_peak_frac,
-                                    max_events_per_tf = max_events_per_tf)
+                                    max_events_per_tf = max_events_per_tf,
+                                    merge_position    = merge_position,
+                                    max_grna_distance = max_grna_distance)
       })
 
       # Multi-page PDF: 1 TF per page (cleaner than a giant patchwork grid now

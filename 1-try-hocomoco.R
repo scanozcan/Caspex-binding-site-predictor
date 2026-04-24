@@ -21,7 +21,7 @@ result <- run_caspex_hocomoco(
   hocomoco_species = "human",                # "human" (default) or "mouse"
   coverage_correct = TRUE,                   # coverage-aware per-motif scoring
   cov_floor        = 0.05,
-  edge_guard_frac  = 0.15
+  edge_guard_frac  = 0.25
 )
 
 source("caspex_extras.R")
