@@ -1,4 +1,4 @@
-# CasPEX Binding Zone Predictor
+# CASPEX TF-Binding Zone Predictor
 
 A single-file R pipeline that turns **tiled-gRNA CasPEX / GLoPro / CAPLOCUS** proximity-labeling proteomics data into a spatial map of predicted transcription-factor (TF) binding zones on a gene's promoter.
 
@@ -50,7 +50,7 @@ source("caspex_analysis.R")
 inputs <- load_caspex_inputs("example_inputs")
 
 result <- run_caspex(
-  gene             = "ATP7B",                # any HGNC symbol
+  gene             = "gene_name",                # any HGNC symbol
   grnas            = inputs$grnas,
   data_files       = inputs$data_files,
   out_dir          = "caspex_output",
@@ -65,7 +65,7 @@ source("caspex_extras.R")
 extras <- run_caspex_extras(result, out_dir = "caspex_output/extras")
 ```
 
-The thin wrappers `1-try.R` and `1-try-hocomoco.R` reproduce this end-to-end for the shipped ATP7B example; run `source("1-try.R")` for the JASPAR-backed run or `source("1-try-hocomoco.R")` for the HOCOMOCO-backed run.
+The thin wrappers `1-try.R` and `1-try-hocomoco.R` reproduce this end-to-end for the shipped example; run `source("1-try.R")` for the JASPAR-backed run or `source("1-try-hocomoco.R")` for the HOCOMOCO-backed run.
 
 ---
 
@@ -332,63 +332,8 @@ Only motifs with `β_k > 0.15 · max(β)` become bubbles. All the other PWM hits
 
 ---
 
-## 7. Known pitfalls we've fixed
 
-A running log of bugs encountered during development and how they were resolved — useful if you extend the tool.
-
-### 7.1 JASPAR returned "no motif found" for every TF
-- **Symptom**: all 10 lookups reported `no motif found`.
-- **Cause**: using the wrong query parameter (`name=` instead of `tf_name=`) against the JASPAR REST API, combined with an invalid `version=latest` filter.
-- **Fix**: switch to `tf_name=<SYMBOL>&collection=CORE&tax_group=vertebrates&order=-version`, drop the version filter, and host on `jaspar.elixir.no`.
-
-### 7.2 Every TF returned the same MA0007.4 matrix with 68 identical hits
-- **Symptom**: 36 different queries all came back with the same matrix.
-- **Cause**: a fall-through `if (length(keep) == 0) keep <- seq_along(results)` — when no name matched, the first arbitrary hit was accepted.
-- **Fix**: `pick_match()` now returns `NULL` on no name match; paginated + three-tier fallback (`tf_name=` → `search=` → `name=`) is exhausted before reporting no motif.
-
-### 7.3 Motif ticks plotted at the top of the plot in different colors (ggplot late binding)
-- **Symptom**: ticks for all TFs piled at the top of the plot, coloured per TF.
-- **Cause**: classic ggplot2 **lazy evaluation** — `aes(y = i + 0.10, yend = i + 0.38)` captured `i` as a quosure, which was resolved at render time using the final loop value.
-- **Fix**: bake `i` into the data frame (`tick_df <- data.frame(x = hits, y0 = i + 0.10, y1 = i + 0.38)`) and reference only column names inside `aes()`.
-
-### 7.4 Decomposition events "flying over" the histogram
-- **Symptom**: predicted events plotted at `y = weight` drifted into the upper region of the plot because β amplitudes live on a different scale from the logFC signal.
-- **Fix**: move events to a **called-peak track below baseline** at `event_y = −0.20 × sig_max`, with a shaded strip container, dotted connectors up to the signal peak, and a custom axis break function to hide negative tick labels.
-
-### 7.5 Motif ticks still floating above the ribbon in the partitioned tracks
-- **Symptom**: in `plot_tf_track`, when the ribbon was low (away from centroid), motif ticks appeared high up.
-- **Fix**: re-lay the lane genome-browser-style — ribbon in upper sub-lane (`y ∈ [i − 0.15, i + 0.45]`), motif ticks in lower sub-lane (`y ∈ [i − 0.42, i − 0.22]`) with a faint colored strip framing them.
-
-### 7.6 Region-specific plot overloaded
-- **Symptom**: a single page combined all region-specific TFs from all regions, making it hard to read when N is 20+.
-- **Fix**: emit `08_...` and `09_...` as **multi-page PDFs, one page per region**, each labelled "Region R*" with that region's specific TF set only.
-
-### 7.7 Deconvolution limited to top-12
-- **Fix**: run `plot_binding_deconvolution()` for all TFs in the `motif_tfs` set (common + region-specific). Output is a multi-page PDF with TFs-with-events first (sorted by total weight), then TFs-without-events alphabetical.
-
-### 7.8 Same TF appearing in both common and region-specific decks
-- **Symptom**: e.g. GATA6 shows up in `07_tf_track_common_motifs.pdf` **and** as a lane in `09_tf_track_region_specific_motifs.pdf` — duplicate plotting with no new information.
-- **Fix**: in `select_motif_tfs()`, filter each region's `specific_list[[r]]` to drop anything already in `common_tfs` *before* taking the top-N. Each TF now appears in exactly one deck. Disjointness is asserted at the end of selection; a violation raises an R `warning()`.
-
-### 7.9 Negative-logFC lollipops buried under the motif/event track
-- **Symptom**: in `plot_binding_deconvolution()`, a region with negative logFC (depletion) drew its lollipop tip into the motif sub-lane or under the event circles, because the shaded "called-peak" strip was anchored between `y = 0` and `y = −0.28·sig_max`.
-- **Fix**: float the strip relative to the lowest lollipop. Compute `track_top = min(0, lfc) − 0.06·sig_max` and place motif ticks, event circles, and the shaded rect below `track_top`.
-
-### 7.10 Same TF appearing on multiple region-specific pages
-- **Symptom**: after the 7.8 fix, a "region-specific" TF like POU3F2 still appeared on TWO region pages because its `specificity(p, R)` score was in the top-5 for both regions.
-- **Final fix (three-bucket partition)**: the argmax step was replaced with a partition that gives ≥ 2-region TFs their own deck (11/12), preserving the full set of regions where each TF is significant. Argmax assignment is no longer used.
-
-### 7.11 Argmax assignment collapses 2-region TFs into one region
-- **Fix**: **three-bucket partition**. The non-common candidate pool is split by significant-region count: TFs significant in **exactly 1 region** go to the region-specific deck (08/09, top `n_specific` per region); TFs significant in **≥ 2 regions** go to a new **shared-focal deck** (11/12, top `n_shared` by summed specificity across their significant regions).
-
-### 7.12 West-edge false positives from low-denominator β inflation
-- **Symptom**: for sparsely-tiled promoters, `plot_binding_deconvolution()` surfaced spurious motif calls at the far west (upstream) end of the window — a contiguous above-threshold zone on β(x) that touched the grid edge and swept in any motif that happened to sit inside it.
-- **Cause**: the `cov_floor` clamp bounds the minimum denominator, but just *inside* the clamp boundary the denominator is still near its minimum. Any residual kernel tail of `s(x)` there gets divided by a tiny `C(x)` and inflates β into an edge-adjacent zone.
-- **Fix**: `edge_guard_frac` (default `0.15`) defines a second, stricter mask `support_mask = C(x) > max(cov_floor, edge_guard_frac) · max(C)`. Zone detection on β and peak detection on `s(x)` both happen only inside the mask. The motif-less fallback additionally peak-finds on the raw `s(x)` rather than on `β(x)`, which further neutralises the edge-ramp failure mode for TFs without a PWM.
-
----
-
-## 8. Dependencies
+## 7. Dependencies
 
 Base R (≥ 4.0) plus:
 
@@ -405,7 +350,7 @@ install.packages(c("httr","jsonlite","ggplot2","dplyr","tidyr",
 
 ---
 
-## 9. Return value
+## 8. Return value
 
 `run_caspex()` invisibly returns a list with:
 
@@ -454,22 +399,22 @@ inspect_tf(result, "GATA6")                   # per-TF inspector
 
 ---
 
-## 10. Files in this folder
+## 9. Files in this folder
 
 - `caspex_analysis.R` — the pipeline (single source of truth, JASPAR-backed).
 - `caspex_analysis_hocomoco.R` — **alternative motif backend**: same pipeline wired to HOCOMOCO v11/v12 PWMs. Sources `caspex_analysis.R` automatically. See §11.
 - `caspex_extras.R` — supplementary result plots and diagnostics (per-TF one-pagers, TF co-occurrence, ranked events, permutation null, σ sensitivity, jackknife, volcanoes, QC, plus coverage-aware diagnostics D.1–D.3). Source *after* `caspex_analysis.R`; see §12.
-- `1-try.R` — thin runner for the shipped ATP7B 7-gRNA dataset (JASPAR backend, coverage-aware).
+- `1-try.R` — thin runner for the shipped gene specific 7-gRNA dataset (JASPAR backend, coverage-aware).
 - `1-try-hocomoco.R` — same runner using the HOCOMOCO backend.
 - `2-run_caspex_extras_in_all.R` — regenerate the supplementary plots for an existing `result` object without re-running the primary pipeline.
-- `example_inputs/` — per-region manifest (`grnas.tsv`) and the seven `Region*.txt` tables for the shipped ATP7B example.
+- `example_inputs/` — per-region manifest (`grnas.tsv`) and the seven `Region*.txt` tables for the shipped example.
 - `caspex_output/` — everything the pipeline writes (PDFs + CSVs above), including an `extras/` subfolder when the extras runner has been invoked.
 - `caspex_output_hocomoco/` — default output folder of the HOCOMOCO runner.
 - `README.md` — this document (user/developer guide).
 
 ---
 
-## 11. HOCOMOCO backend (`caspex_analysis_hocomoco.R`)
+## 10. HOCOMOCO backend (`caspex_analysis_hocomoco.R`)
 
 An alternative motif source for the *exact same* pipeline. Same spatial model, same binding-event decomposition, same plots — the only thing that changes is where TF position-weight matrices come from.
 
@@ -481,7 +426,7 @@ An alternative motif source for the *exact same* pipeline. Same spatial model, s
 
 ### Quick start
 
-A ready-to-run script (`1-try-hocomoco.R`) mirrors `1-try.R` but calls the HOCOMOCO backend. Source it to reproduce the ATP7B analysis end-to-end:
+A ready-to-run script (`1-try-hocomoco.R`) mirrors `1-try.R` but calls the HOCOMOCO backend. Source it to reproduce the analysis end-to-end:
 
 ```r
 source("1-try-hocomoco.R")
@@ -495,7 +440,7 @@ source("caspex_analysis_hocomoco.R")   # also sources caspex_analysis.R
 inputs <- load_caspex_inputs("example_inputs")
 
 result <- run_caspex_hocomoco(
-  gene             = "ATP7B",
+  gene             = "gene_name",
   grnas            = inputs$grnas,
   data_files       = inputs$data_files,
   out_dir          = "caspex_output_hocomoco",
@@ -548,7 +493,7 @@ source("caspex_analysis.R")
 source("caspex_extras.R")
 
 inputs <- load_caspex_inputs("example_inputs")
-result <- run_caspex(gene = "ATP7B",
+result <- run_caspex(gene = "gene_name",
                      grnas = inputs$grnas,
                      data_files = inputs$data_files,
                      coverage_correct = TRUE,
