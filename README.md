@@ -1,4 +1,4 @@
-# CasPEX Binding Zone Predictor
+# CASPEX TF-Binding Zone Predictor
 
 A single-file R pipeline that turns **tiled-gRNA CasPEX / GLoPro / CAPLOCUS** proximity-labeling proteomics data into a spatial map of predicted transcription-factor (TF) binding zones on a gene's promoter.
 
