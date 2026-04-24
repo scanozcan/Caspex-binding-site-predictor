@@ -27,6 +27,26 @@ suppressPackageStartupMessages({
   library(patchwork)
 })
 
+# Tiny helper — R < 4.4 lacks the %||% operator. Defined unconditionally here
+# (and redundantly in caspex_chipatlas.R so that file remains sourceable on
+# its own) since several downstream blocks rely on it.
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || is.na(a[[1]])) b else a
+
+# Optional ChIP-Atlas peak backend. Sourced best-effort: if the file is
+# missing (e.g. running from a partial checkout) we leave the flag FALSE so
+# run_caspex() can detect it and skip the ChIP-Atlas track rather than
+# bombing out.
+.caspex_chipatlas_loaded <- FALSE
+local({
+  cand <- c("caspex_chipatlas.R",
+            file.path(getwd(), "caspex_chipatlas.R"))
+  cand <- cand[file.exists(cand)]
+  if (length(cand)) {
+    source(cand[1], local = FALSE)
+    assign(".caspex_chipatlas_loaded", TRUE, envir = .GlobalEnv)
+  }
+})
+
 # ── Palette & theme ───────────────────────────────────────────────────────────
 
 COLS <- list(
@@ -1196,7 +1216,28 @@ predict_binding_events_coverage_aware <- function(
     # `kernel_sigma` at runtime (so "events within one σ of a guide").
     # Set `Inf` to disable. Set to a smaller multiple of σ (e.g. 0.75·σ)
     # to be stricter about tail leakage.
-    max_grna_distance = NULL
+    max_grna_distance = NULL,
+    # `edge_grna_weight_cap`: fraction-of-Gaussian-weight-sum above which an
+    # outermost gRNA (westernmost OR easternmost) is considered to be
+    # "dominating" an event's local signal. Events where either boundary
+    # guide contributes more than this fraction of the summed per-gRNA
+    # Gaussian weight at the event position are dropped.
+    #
+    # Motivates this: `max_grna_distance` gates events by distance to the
+    # NEAREST guide, which protects against tail leakage past the outermost
+    # gRNA, but does nothing for interior events that still get much of
+    # their β from the westernmost / easternmost guide's kernel tail. In
+    # ATP7B at σ=300, R7(-1945) contributes ~37% of the summed Gaussian
+    # weight at position -1620 even though R6(-1507) is only 113 bp away —
+    # producing a huge "edge-inflated" bubble at a position that is fully
+    # inside the trusted support mask.
+    #
+    # 0.30 is a reasonable starting point — it keeps events that are
+    # solidly backed by interior guides while rejecting those where a
+    # single boundary guide accounts for more than a third of the local
+    # per-gRNA weight sum.  NULL (default) disables the filter entirely,
+    # preserving legacy behaviour.
+    edge_grna_weight_cap = NULL
 ) {
   merge_position <- match.arg(merge_position)
   # Resolve NULL → kernel_sigma. Doing this in the body (not as a default
@@ -1447,6 +1488,37 @@ predict_binding_events_coverage_aware <- function(
     out <- out[out$distance_to_nearest_grna <= max_grna_distance, ,
                drop = FALSE]
   }
+  # Edge-gRNA dominance filter. For each candidate event position p, compute
+  # the per-gRNA Gaussian weight w_i(p) = exp(-0.5 · ((p - r_i)/σ)²) and the
+  # fractional contribution of each gRNA: f_i(p) = w_i(p) / Σ_j w_j(p). If
+  # EITHER the westernmost (min r_i) or easternmost (max r_i) guide has
+  # f_i(p) > edge_grna_weight_cap, drop the event — it's being inflated by
+  # a boundary guide's kernel tail even though it may sit inside the
+  # support mask and within max_grna_distance of some interior guide.
+  # Applies only in coverage-aware paths that actually defined such a cap;
+  # NULL keeps legacy behaviour.
+  if (nrow(out) > 0 && !is.null(edge_grna_weight_cap) &&
+      is.finite(edge_grna_weight_cap) && length(pos_r) >= 2) {
+    left_r  <- min(pos_r)
+    right_r <- max(pos_r)
+    # Vectorised weight matrix: rows = events, cols = gRNAs
+    d   <- outer(out$position, pos_r, FUN = function(p, r) p - r)
+    w   <- exp(-0.5 * (d / kernel_sigma)^2)
+    wsum <- rowSums(w)
+    wsum[wsum <= 0] <- 1   # defensive: avoid divide-by-zero
+    idx_left  <- which(pos_r == left_r)[1]
+    idx_right <- which(pos_r == right_r)[1]
+    frac_left  <- w[, idx_left]  / wsum
+    frac_right <- w[, idx_right] / wsum
+    edge_frac  <- pmax(frac_left, frac_right)
+    keep <- edge_frac <= edge_grna_weight_cap
+    if (!all(keep)) {
+      message(sprintf(
+        "    edge_grna_weight_cap(%.2f): dropped %d/%d %s event(s)",
+        edge_grna_weight_cap, sum(!keep), length(keep), tf_name))
+    }
+    out <- out[keep, , drop = FALSE]
+  }
   if (nrow(out) == 0) return(empty)
   out <- out[order(out$weight, decreasing = TRUE), , drop = FALSE]
   # Top-N cap (readability backstop). Applied AFTER merging so merged
@@ -1485,7 +1557,8 @@ predict_all_binding_events <- function(tfs, long_data, pos_map, motif_results,
                                         # predict_binding_events_coverage_aware()
                                         # for the full description.
                                         merge_position    = c("argmax", "centroid"),
-                                        max_grna_distance = NULL) {
+                                        max_grna_distance = NULL,
+                                        edge_grna_weight_cap = NULL) {
   mode_tag <- if (coverage_correct)
     "coverage-normalized per-motif (s/C)" else "smoothed-s(x) NNLS"
   message("\nPredicting binding events (", mode_tag, ", \u03c3=",
@@ -1508,6 +1581,7 @@ predict_all_binding_events <- function(tfs, long_data, pos_map, motif_results,
         max_events_per_tf = max_events_per_tf,
         merge_position    = merge_position,
         max_grna_distance = max_grna_distance,
+        edge_grna_weight_cap = edge_grna_weight_cap,
         x_grid          = x_grid
       )
     } else {
@@ -1564,7 +1638,13 @@ plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
                                         zone_peak_frac    = 0.50,
                                         max_events_per_tf = 30,
                                         merge_position    = c("argmax", "centroid"),
-                                        max_grna_distance = NULL) {
+                                        max_grna_distance = NULL,
+                                        edge_grna_weight_cap = NULL,
+                                        # ChIP-Atlas overlay: data.frame as returned
+                                        # by fetch_chipatlas_peaks() for THIS TF
+                                        # (cols srx, cell_type, start_rel, end_rel,
+                                        # ...). NULL skips the sub-lane.
+                                        chipatlas_peaks   = NULL) {
   x_grid <- seq(-upstream, downstream, by = 5)
   sig    <- build_caspex_signal(tf_name, long_data, pos_map, x_grid,
                                  kernel_sigma, weight_mode)
@@ -1580,6 +1660,7 @@ plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
       max_events_per_tf = max_events_per_tf,
       merge_position    = merge_position,
       max_grna_distance = max_grna_distance,
+      edge_grna_weight_cap = edge_grna_weight_cap,
       x_grid          = x_grid)
   } else {
     predict_binding_events(tf_name, long_data, pos_map, motif_hits,
@@ -1589,19 +1670,28 @@ plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
   }
   rd      <- sig$region_data
   sig_max <- max(c(sig$y, rd$lfc, 1), na.rm = TRUE)
+  # Clip motif ticks to the gRNA-supported region (one kernel σ past the
+  # outermost guides on each side). Past that envelope, CasPEX has no
+  # signal to pair with sequence-level motifs, so showing ticks there is
+  # visual noise that invites misreading. Without this clip, the ggplot
+  # panel auto-expands whenever the ChIP-Atlas band is drawn at the full
+  # [-upstream, downstream] width, which makes far-upstream motif clusters
+  # (e.g. the NR2F1 cluster past -2000 on ATP7B where R7 ≈ -1900 is the
+  # westernmost guide) suddenly visible even though no events are — or
+  # ever could be — called in that region. The other mini-browser decks
+  # (07/09/12) intentionally show the full motif window; this detail plot
+  # scopes to what the detector can actually resolve.
+  pos_r_detect <- sort(as.numeric(pos_map[!is.na(pos_map)]))
+  if (length(pos_r_detect) >= 1) {
+    left_cut  <- min(pos_r_detect) - kernel_sigma
+    right_cut <- max(pos_r_detect) + kernel_sigma
+  } else {
+    left_cut  <- -upstream
+    right_cut <-  downstream
+  }
   motif_hits_in <- motif_hits[!is.na(motif_hits) &
-                                motif_hits >= -upstream &
-                                motif_hits <= downstream]
-  # NOTE: we intentionally do NOT apply the coverage-floor clip here. The
-  # motif strip in this plot should match the motif ticks shown in
-  # 07_track_common_motif.pdf / 09_track_region_specific_motif.pdf /
-  # 12_track_shared_motif.pdf exactly — those plots show every JASPAR hit
-  # in the upstream/downstream window with no coverage-aware filtering, so
-  # this one does too. The detector still rejects floor-clamped zones
-  # internally when coverage_correct = TRUE (visible in the event circles,
-  # not the ticks). Keeping the visual strip identical across modes also
-  # makes the "%d motif candidate(s)" count in the subtitle directly
-  # comparable between default and coverage-aware runs.
+                                motif_hits >= max(-upstream, left_cut) &
+                                motif_hits <= min(downstream, right_cut)]
   sig_df <- data.frame(x = x_grid, y = sig$y)
 
   # Called-peak track y-positions. Float the whole strip BELOW the most-
@@ -1615,6 +1705,20 @@ plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
   motif_y_bot <- track_top - 0.10 * sig_max
   event_y     <- track_top - 0.20 * sig_max
   track_bot   <- track_top - 0.28 * sig_max
+
+  # ChIP-Atlas sub-lane sits BELOW the event bubbles, stacked one row per
+  # SRX experiment. Height scales with the number of experiments but is
+  # capped so the deck stays readable. If no peaks were passed, these
+  # y-coords collapse to track_bot and the lane draws nothing.
+  ca_rows <- if (!is.null(chipatlas_peaks) && nrow(chipatlas_peaks) > 0) {
+    unique(chipatlas_peaks$srx)
+  } else character(0)
+  n_ca_rows <- length(ca_rows)
+  # Total height for the ChIP-Atlas band (as a fraction of sig_max).
+  ca_band_h <- if (n_ca_rows == 0) 0 else min(0.50, 0.025 * n_ca_rows + 0.06)
+  ca_gap    <- if (n_ca_rows == 0) 0 else 0.03 * sig_max
+  ca_top    <- track_bot - ca_gap
+  ca_bot    <- ca_top - ca_band_h * sig_max
 
   p <- ggplot() +
     # --- upper panel: signal + region logFCs --------------------------------
@@ -1679,6 +1783,43 @@ plot_binding_deconvolution <- function(tf_name, long_data, pos_map, motif_hits,
                     label = sprintf("%+.0f", position)),
                 size = 2.4, fontface = "bold", vjust = 2.4,
                 color = COLS$high)
+  }
+
+  # --- ChIP-Atlas stacked-experiment sub-lane ---------------------------------
+  # Each SRX occupies a thin row in the (ca_bot, ca_top) band. Peak intervals
+  # are drawn as short horizontal bars clipped to the promoter window. A thin
+  # separator strip above and a row label on the right-hand margin help read
+  # the stack when it's crowded.
+  if (n_ca_rows > 0) {
+    row_h <- (ca_top - ca_bot) / n_ca_rows
+    # Newest-first by SRX number (matches the cap ordering upstream).
+    ord   <- order(suppressWarnings(as.integer(sub("SRX", "", ca_rows))),
+                   decreasing = TRUE)
+    srx_levels <- ca_rows[ord]
+    ca <- chipatlas_peaks
+    ca$srx <- factor(ca$srx, levels = srx_levels)
+    ca$y_mid <- ca_top - (as.integer(ca$srx) - 0.5) * row_h
+    # Clip to the plotted window so a peak that spills past doesn't drag the
+    # lane off-axis. Also widen 1-bp intervals to at least ~10 bp so they
+    # render visibly.
+    ca$xs <- pmax(ca$start_rel, -upstream)
+    ca$xe <- pmin(ca$end_rel,    downstream)
+    ca$xs <- pmin(ca$xs, ca$xe - 5)   # ensure non-zero width
+    p <- p +
+      # Background band so the sub-lane is visible even when peaks are sparse.
+      annotate("rect",
+               xmin = -upstream, xmax = downstream,
+               ymin = ca_bot,    ymax = ca_top,
+               fill = "grey98", color = NA) +
+      geom_segment(data = ca,
+                   aes(x = xs, xend = xe, y = y_mid, yend = y_mid),
+                   color = COLS$tss, linewidth = 0.5, alpha = 0.65,
+                   lineend = "butt") +
+      annotate("text",
+               x = downstream, y = (ca_top + ca_bot) / 2,
+               label = sprintf("ChIP-Atlas  \u00b7  %d SRX", n_ca_rows),
+               hjust = 1.02, vjust = -0.6, size = 2.3,
+               color = "grey35", fontface = "italic")
   }
 
   p +
@@ -2053,7 +2194,11 @@ plot_tf_track <- function(tfs, spatial_df, pos_map, promoter_info,
                           lane_labels   = NULL,
                           upstream = 2500, downstream = 500,
                           title = "Predicted TF binding zones",
-                          subtitle = NULL) {
+                          subtitle = NULL,
+                          # ChIP-Atlas overlay: named list (TF -> data.frame of
+                          # windowed peaks, cols start_rel/end_rel/srx/...), or
+                          # NULL to skip the sub-lane.
+                          chipatlas_peaks = NULL) {
   tfs <- as.character(tfs)
   tfs <- tfs[tfs %in% as.character(spatial_df$protein)]
   tfs <- unique(tfs)
@@ -2079,7 +2224,8 @@ plot_tf_track <- function(tfs, spatial_df, pos_map, promoter_info,
     } else {
       paste0("Upper ribbon = spatial enrichment (Gaussian)  |  ",
              "Lower sub-lane ticks = JASPAR motif hits  |  ",
-             "Vertical line = binding centroid")
+             "Vertical line = binding centroid",
+             if (!is.null(chipatlas_peaks)) "  |  dark strip = ChIP-Atlas union peaks" else "")
     }
   }
 
@@ -2104,12 +2250,39 @@ plot_tf_track <- function(tfs, spatial_df, pos_map, promoter_info,
 
   # Per-lane layout (genome-browser style):
   #   [i-0.50 ------------------------ i+0.50]   lane extent
+  #   [i-0.48 ... i-0.44]                        ChIP-Atlas union-peak strip
   #   [i-0.42 ... i-0.22]                        motif sub-lane (ticks BELOW)
   #   [i-0.15 ... i+0.45]                        enrichment ribbon (ABOVE ticks)
   ribbon_base <- -0.15   # ribbon baseline, relative to lane center (i)
   ribbon_h    <-  0.60   # max ribbon height
   motif_y0    <- -0.42   # motif tick bottom
   motif_y1    <- -0.22   # motif tick top
+  chip_y0     <- -0.48   # ChIP-Atlas strip bottom
+  chip_y1     <- -0.44   # ChIP-Atlas strip top
+
+  # Interval union helper — collapses overlapping peak intervals to a minimal
+  # set of non-overlapping ones. Input is a data.frame with start_rel/end_rel
+  # columns; output is a 2-column data.frame (xs, xe).
+  .union_intervals <- function(df) {
+    if (is.null(df) || nrow(df) == 0) return(data.frame(xs = numeric(0), xe = numeric(0)))
+    iv <- data.frame(xs = pmin(df$start_rel, df$end_rel),
+                     xe = pmax(df$start_rel, df$end_rel))
+    iv <- iv[order(iv$xs), , drop = FALSE]
+    merged_xs <- iv$xs[1]; merged_xe <- iv$xe[1]
+    out_xs <- numeric(0); out_xe <- numeric(0)
+    if (nrow(iv) >= 2) {
+      for (k in 2:nrow(iv)) {
+        if (iv$xs[k] <= merged_xe) {
+          merged_xe <- max(merged_xe, iv$xe[k])
+        } else {
+          out_xs <- c(out_xs, merged_xs); out_xe <- c(out_xe, merged_xe)
+          merged_xs <- iv$xs[k]; merged_xe <- iv$xe[k]
+        }
+      }
+    }
+    out_xs <- c(out_xs, merged_xs); out_xe <- c(out_xe, merged_xe)
+    data.frame(xs = out_xs, xe = out_xe)
+  }
 
   for (i in seq_along(tfs)) {
     tf  <- tfs[i]
@@ -2156,6 +2329,27 @@ plot_tf_track <- function(tfs, spatial_df, pos_map, promoter_info,
           geom_point(data = tick_df,
                      aes(x = x, y = yc),
                      color = col, size = 1.1, alpha = 0.9)
+      }
+    }
+
+    # ChIP-Atlas union-peak strip (compact — lanes are space-constrained here;
+    # the full stacked-SRX view lives in Plot 10). Renders only when we were
+    # handed a per-TF peak table; unions overlapping intervals across all
+    # SRXs so the strip shows "where public ChIP-seq ever called a peak for
+    # this TF in the promoter window".
+    if (!is.null(chipatlas_peaks) && tf %in% names(chipatlas_peaks) &&
+        !is.null(chipatlas_peaks[[tf]]) && nrow(chipatlas_peaks[[tf]]) > 0) {
+      ivs <- .union_intervals(chipatlas_peaks[[tf]])
+      # Clip to window
+      ivs$xs <- pmax(ivs$xs, -upstream)
+      ivs$xe <- pmin(ivs$xe,  downstream)
+      ivs <- ivs[ivs$xe > ivs$xs, , drop = FALSE]
+      if (nrow(ivs) > 0) {
+        ivs$ymin <- i + chip_y0; ivs$ymax <- i + chip_y1
+        p <- p + geom_rect(data = ivs,
+                           aes(xmin = xs, xmax = xe,
+                               ymin = ymin, ymax = ymax),
+                           fill = "grey20", color = NA, alpha = 0.75)
       }
     }
 
@@ -2522,6 +2716,17 @@ run_caspex <- function(
     # `edge_guard_frac`: the relative-coverage mask does not auto-rescale
     # with kernel_sigma, this one does.
     max_grna_distance = NULL,
+    # `edge_grna_weight_cap` (coverage-aware only): fraction in (0, 1], or
+    # NULL to disable (default). Drops events where either boundary gRNA
+    # (westernmost `min(pos_r)` or easternmost `max(pos_r)`) contributes
+    # more than this fraction of the local Gaussian weight sum
+    # Σ_i exp(-0.5·((p - r_i)/σ)²). Suppresses "edge-bleed" events in the
+    # tail beyond the outermost guides where a single boundary guide can
+    # inflate the NNLS β at interior positions far from its own coordinate
+    # (seen on ATP7B at p=-1620 where R7 @ -1945 contributes ~37%).
+    # Complements `max_grna_distance` (which is a pure geometric cap on
+    # position→nearest-guide): this one caps Gaussian weight-share.
+    edge_grna_weight_cap = NULL,
     # Region-weight mode — applied to BOTH spatial model and signal building.
     # "mod_t" (default) = moderated t (from limma) if the input files carry a
     # `t` column, else a signed z-score derived from the p-value. Alternatives:
@@ -2529,6 +2734,17 @@ run_caspex <- function(
     weight_mode      = "mod_t",
     # Backward-compat alias; if set, overrides weight_mode for signal building
     signal_weight    = NULL,
+    # ChIP-Atlas overlay (public ChIP-seq peaks as a supplementary track):
+    #   chipatlas               - FALSE (default, off so runs stay network-free)
+    #                             / TRUE to fetch + render peaks for every
+    #                             motif-scanned TF.
+    #   chipatlas_threshold     - "05" (Q<1e-5, default), "10", or "20".
+    #   chipatlas_max_experiments - cap on SRXs per TF (default 50; newest first).
+    #   chipatlas_quiet         - suppress per-SRX download messages.
+    chipatlas               = FALSE,
+    chipatlas_threshold     = "05",
+    chipatlas_max_experiments = 50,
+    chipatlas_quiet         = TRUE,
     detail_top_n     = 12,
     save_plots    = TRUE,
     plot_width    = 12,
@@ -2592,6 +2808,30 @@ run_caspex <- function(
 
   motif_res <- run_motif_scan(motif_tfs, promoter_info, motif_thresh)
 
+  # ── 5a. ChIP-Atlas peak overlay (optional) ────────────────────────────────
+  # Pulls public ChIP-seq peaks for every motif-scanned TF from ChIP-Atlas,
+  # windowed to the same promoter region. Used as a supplementary validation
+  # track in plots 06/07, 08/09, 11/12 (union peak row per TF) and 10
+  # (stacked per-experiment ticks below the bubble strip).
+  chipatlas_res <- NULL
+  if (isTRUE(chipatlas)) {
+    if (!isTRUE(.caspex_chipatlas_loaded)) {
+      warning("chipatlas=TRUE but caspex_chipatlas.R could not be sourced; ",
+              "skipping ChIP-Atlas overlay.")
+    } else {
+      chipatlas_res <- run_chipatlas_scan(
+        tfs              = motif_tfs,
+        gene_info        = gene_info,
+        promoter_info    = promoter_info,
+        upstream         = upstream,
+        downstream       = downstream,
+        threshold        = chipatlas_threshold,
+        max_experiments  = chipatlas_max_experiments,
+        quiet            = chipatlas_quiet
+      )
+    }
+  }
+
   # ── 5b. Motif-constrained binding deconvolution ──────────────────────────
   x_grid_bind <- seq(-upstream, downstream, by = 5)
   binding_events <- predict_all_binding_events(
@@ -2611,7 +2851,8 @@ run_caspex <- function(
     zone_peak_frac    = zone_peak_frac,
     max_events_per_tf = max_events_per_tf,
     merge_position    = merge_position,
-    max_grna_distance = max_grna_distance
+    max_grna_distance = max_grna_distance,
+    edge_grna_weight_cap = edge_grna_weight_cap
   )
   message("  Total predicted events: ", nrow(binding_events),
           "  (across ", length(unique(binding_events$tf)), " TFs)")
@@ -2656,6 +2897,7 @@ run_caspex <- function(
                                                   " by composite score)"))
   p_common_motif <- plot_tf_track(common_tfs, spatial_df, pos_map, promoter_info,
                                    motif_results = motif_res,
+                                   chipatlas_peaks = chipatlas_res,
                                    upstream = upstream, downstream = downstream,
                                    title = paste0("Common TFs + JASPAR motifs — ",
                                                   gene_info$name))
@@ -2669,6 +2911,7 @@ run_caspex <- function(
       shared_tfs)
     plot_tf_track(shared_tfs, spatial_df, pos_map, promoter_info,
                   motif_results = if (with_motif) motif_res else NULL,
+                  chipatlas_peaks = if (with_motif) chipatlas_res else NULL,
                   lane_labels   = lbl,
                   upstream      = upstream, downstream = downstream,
                   title = paste0(
@@ -2697,6 +2940,7 @@ run_caspex <- function(
                     gene_info$name, "  |  Region ", r)
       out[[r]] <- plot_tf_track(tfs_r, spatial_df, pos_map, promoter_info,
                                 motif_results = if (with_motif) motif_res else NULL,
+                                chipatlas_peaks = if (with_motif) chipatlas_res else NULL,
                                 upstream = upstream, downstream = downstream,
                                 title = ttl,
                                 subtitle = paste0("Top ", n_specific,
@@ -2800,7 +3044,10 @@ run_caspex <- function(
                                     zone_peak_frac    = zone_peak_frac,
                                     max_events_per_tf = max_events_per_tf,
                                     merge_position    = merge_position,
-                                    max_grna_distance = max_grna_distance)
+                                    max_grna_distance = max_grna_distance,
+                                    edge_grna_weight_cap = edge_grna_weight_cap,
+                                    chipatlas_peaks   = if (!is.null(chipatlas_res))
+                                                          chipatlas_res[[tf]] else NULL)
       })
 
       # Multi-page PDF: 1 TF per page (cleaner than a giant patchwork grid now
@@ -2889,6 +3136,17 @@ run_caspex <- function(
   message(" Spatial TFs      : ", nrow(spatial_df))
   message(" Binding events   : ", nrow(binding_events),
           " (", length(unique(binding_events$tf)), " TFs)")
+  if (isTRUE(chipatlas) && !is.null(chipatlas_res)) {
+    n_tf_hits <- sum(vapply(chipatlas_res,
+                            function(x) !is.null(x) && nrow(x) > 0,
+                            logical(1)))
+    n_peaks   <- sum(vapply(chipatlas_res,
+                            function(x) if (is.null(x)) 0L else nrow(x),
+                            integer(1)))
+    message(" ChIP-Atlas       : ", n_peaks, " peaks across ",
+            n_tf_hits, "/", length(chipatlas_res),
+            " TFs (threshold=", chipatlas_threshold, ")")
+  }
   message("------------------------------------------------------------------")
   message("Done.")
 
@@ -2916,6 +3174,11 @@ run_caspex <- function(
                                  cov_floor, ", edge_guard_frac=",
                                  edge_guard_frac, ")")
                        else "smoothed-s(x) NNLS (default)",
+    # ChIP-Atlas overlay (named list tf -> data.frame; NULL if chipatlas=FALSE).
+    # Kept on the result so caspex_extras or interactive inspection can reuse
+    # the windowed peak tables without re-hitting the network.
+    chipatlas_peaks       = chipatlas_res,
+    chipatlas_threshold   = if (isTRUE(chipatlas)) chipatlas_threshold else NULL,
     plots = list(grna                 = p_grna,
                  track                = p_track,
                  heat                 = p_heat,

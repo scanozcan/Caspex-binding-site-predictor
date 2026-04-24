@@ -403,6 +403,7 @@ inspect_tf(result, "GATA6")                   # per-TF inspector
 
 - `caspex_analysis.R` — the pipeline (single source of truth, JASPAR-backed).
 - `caspex_analysis_hocomoco.R` — **alternative motif backend**: same pipeline wired to HOCOMOCO v11/v12 PWMs. Sources `caspex_analysis.R` automatically. See §11.
+- `caspex_chipatlas.R` — optional public-ChIP-seq validation overlay (ChIP-Atlas). Auto-sourced by `caspex_analysis.R` when present. See §11.5.
 - `caspex_extras.R` — supplementary result plots and diagnostics (per-TF one-pagers, TF co-occurrence, ranked events, permutation null, σ sensitivity, jackknife, volcanoes, QC, plus coverage-aware diagnostics D.1–D.3). Source *after* `caspex_analysis.R`; see §12.
 - `1-try.R` — thin runner for the shipped gene specific 7-gRNA dataset (JASPAR backend, coverage-aware).
 - `1-try-hocomoco.R` — same runner using the HOCOMOCO backend.
@@ -481,6 +482,34 @@ download_hocomoco_bundle("v12", "human",
 ```
 
 Cache location is `tools::R_user_dir("caspex", which = "cache")`.
+
+---
+
+## 11.5. ChIP-Atlas validation overlay (optional)
+
+Turn on public ChIP-seq peaks from [ChIP-Atlas](https://chip-atlas.dbcls.jp) as a validation track by passing `chipatlas = TRUE` to `run_caspex()`:
+
+```r
+result <- run_caspex(
+  gene       = "ATP7B",
+  grnas      = inputs$grnas,
+  data_files = inputs$data_files,
+  chipatlas                 = TRUE,   # fetch peaks for every motif-scanned TF
+  chipatlas_threshold       = "05",   # "05" = Q<1e-5 (default), "10", "20"
+  chipatlas_max_experiments = 50      # newest-first SRX cap per TF
+)
+```
+
+Peaks render as a sub-lane under each TF's binding-event bubbles in `10_binding_deconvolution.pdf` (one thin row per SRX experiment) and as union-peak strips in the mini-browser decks (06/07, 08/09, 11/12). You can use this to sanity-check predicted binding events against the published literature without leaving the plot.
+
+**First run downloads** (cached to `tools::R_user_dir("caspex", "cache")/chipatlas/`):
+
+- `experimentList.tab` — ChIP-Atlas's master metadata file (~345 MB). One-time.
+- Per-SRX narrowPeak BEDs for every motif-scanned TF — typically a few MB each, capped at `chipatlas_max_experiments` per TF, newest SRX first.
+
+Subsequent runs read from cache and are fully offline. Set `chipatlas = FALSE` (default) to skip the feature entirely and keep the pipeline network-free after the initial JASPAR/HOCOMOCO motif scan.
+
+See `caspex_chipatlas.R` for the backend (cache management via `clear_chipatlas_cache()`, per-TF fetch via `fetch_chipatlas_peaks()`, batch wrapper `run_chipatlas_scan()`).
 
 ---
 
